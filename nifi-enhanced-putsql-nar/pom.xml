@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.acme.nifi</groupId>
+        <artifactId>enhanced-putsql-bundle</artifactId>
+        <version>2.1.0</version>
+    </parent>
+
+    <artifactId>nifi-enhanced-putsql-nar</artifactId>
+    <packaging>nar</packaging>
+    <name>Enhanced PutSQL NAR</name>
+
+    <dependencies>
+        <!-- Include our custom processor module -->
+        <dependency>
+            <groupId>com.acme.nifi</groupId>
+            <artifactId>nifi-enhanced-putsql-processors</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        
+        <!-- NiFi API - Core processor functionality -->
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-api</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        
+
+        
+        <!-- NiFi DBCP Service API - For database connection pool services -->
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-dbcp-service-api</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        
+        <!-- NiFi DBCP Service Implementation - Provided by NiFi runtime -->
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-dbcp-service</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- NiFi Standard Processors - Needed for NAR plugin to introspect processor class during build -->
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-standard-processors</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- MySQL Connector - For database connectivity -->
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- Test Dependencies -->
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-mock</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.nifi</groupId>
+                <artifactId>nifi-nar-maven-plugin</artifactId>
+                <version>${nifi.nar.plugin.version}</version>
+                <extensions>true</extensions>
+                <configuration>
+                    <narId>nifi-enhanced-putsql-nar</narId>
+                    <narGroup>com.acme.nifi</narGroup>
+                    <narVersion>${project.version}</narVersion>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
