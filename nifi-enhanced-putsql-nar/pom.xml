@@ -45,11 +45,12 @@
             <scope>provided</scope>
         </dependency>
 
-        <!-- NiFi Standard Processors - Needed for NAR plugin to introspect processor class during build -->
+        <!-- NiFi Standard Processors - Needed for RollbackOnFailure at runtime -->
+        <!-- Note: This must be available from nifi-standard-processors-nar at runtime -->
         <dependency>
             <groupId>org.apache.nifi</groupId>
             <artifactId>nifi-standard-processors</artifactId>
-            <scope>provided</scope>
+            <scope>compile</scope>
         </dependency>
 
         <!-- MySQL Connector - For database connectivity -->
