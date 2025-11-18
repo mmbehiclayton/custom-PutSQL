@@ -30,7 +30,7 @@ import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.ValidationContext;
 import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.controller.ControllerService;
-import org.apache.nifi.dbcp.DBCPService;
+// DBCPService import removed - using reflection to avoid NoClassDefFoundError
 import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.flowfile.attributes.FragmentAttributes;
@@ -368,13 +368,14 @@ public class EnhancedPutSQL extends AbstractSessionFactoryProcessor {
 
     private final PartialFunctions.InitConnection<FunctionContext, Connection> initConnection = (c, s, fc, ffs) -> {
         final ControllerService service = c.getProperty(CONNECTION_POOL).asControllerService();
-        final DBCPService dbcpService = asDBCPService(service);
+        final Object dbcpService = asDBCPService(service);
         if (dbcpService == null) {
             throw new ProcessException("DBCP Service class not available. Ensure nifi-dbcp-service-api is available in NiFi runtime.");
         }
-        final Connection connection = dbcpService
-                .getConnection(ffs == null || ffs.isEmpty() ? emptyMap() : ffs.get(0).getAttributes());
+        Connection connection = null;
         try {
+            connection = getConnectionFromDBCPService(dbcpService, 
+                    ffs == null || ffs.isEmpty() ? emptyMap() : ffs.get(0).getAttributes());
             fc.originalAutoCommit = connection.getAutoCommit();
             final boolean autocommit = c.getProperty(AUTO_COMMIT).asBoolean();
             if (fc.originalAutoCommit != autocommit) {
@@ -386,6 +387,8 @@ public class EnhancedPutSQL extends AbstractSessionFactoryProcessor {
             }
         } catch (SQLException e) {
             throw new ProcessException("Failed to disable auto commit due to " + e, e);
+        } catch (Exception e) {
+            throw new ProcessException("Failed to get connection from DBCP service: " + e.getMessage(), e);
         }
         return connection;
     };
@@ -800,9 +803,9 @@ public class EnhancedPutSQL extends AbstractSessionFactoryProcessor {
             ControllerService targetService = context.getProperty(TARGET_DBCP_SERVICE).asControllerService();
             
             // Safely cast to DBCPService using helper method
-            DBCPService engineDbcp = asDBCPService(engineService);
-            DBCPService sourceDbcp = asDBCPService(sourceService);
-            DBCPService targetDbcp = asDBCPService(targetService);
+            Object engineDbcp = asDBCPService(engineService);
+            Object sourceDbcp = asDBCPService(sourceService);
+            Object targetDbcp = asDBCPService(targetService);
             
             if (engineDbcp == null || sourceDbcp == null || targetDbcp == null) {
                 flowFile = session.putAttribute(flowFile, "validation.error", 
@@ -812,35 +815,52 @@ public class EnhancedPutSQL extends AbstractSessionFactoryProcessor {
             }
             
             // Step 4: Perform validation
-            ValidationResultData validationResult = performEnvironmentValidation(
-                context, flowFile, engineDbcp, sourceDbcp, targetDbcp, operationId);
-            
-            if (!validationResult.isValid()) {
-                String validationMode = context.getProperty(VALIDATION_MODE).getValue();
+            try {
+                ValidationResultData validationResult = performEnvironmentValidation(
+                    context, flowFile, engineDbcp, sourceDbcp, targetDbcp, operationId);
                 
-                if ("STRICT".equals(validationMode)) {
-                    // BLOCK execution - route to validation_failed
-                    flowFile = session.putAttribute(flowFile, "validation.passed", "false");
-                    flowFile = session.putAttribute(flowFile, "validation.error", 
-                        validationResult.getErrorMessage());
+                if (!validationResult.isValid()) {
+                    String validationMode = context.getProperty(VALIDATION_MODE).getValue();
+                    
+                    if ("STRICT".equals(validationMode)) {
+                        // BLOCK execution - route to validation_failed
+                        flowFile = session.putAttribute(flowFile, "validation.passed", "false");
+                        flowFile = session.putAttribute(flowFile, "validation.error", 
+                            validationResult.getErrorMessage());
+                        flowFile = session.putAttribute(flowFile, "validation.timestamp", 
+                            String.valueOf(System.currentTimeMillis()));
+                        session.transfer(flowFile, REL_VALIDATION_FAILED);
+                        return; // CRITICAL: Don't call process.onTrigger()
+                    } else {
+                        // WARNING mode: Log but continue
+                        getLogger().warn("Environment validation warning: {} - Proceeding anyway", 
+                            validationResult.getErrorMessage());
+                    }
+                } else {
+                    // Validation passed - add success attributes
+                    flowFile = session.putAttribute(flowFile, "validation.passed", "true");
+                    flowFile = session.putAttribute(flowFile, "validation.environment.id", 
+                        String.valueOf(validationResult.getEnvironmentId()));
+                    flowFile = session.putAttribute(flowFile, "validation.environment.name", 
+                        validationResult.getEnvironmentName());
                     flowFile = session.putAttribute(flowFile, "validation.timestamp", 
                         String.valueOf(System.currentTimeMillis()));
-                    session.transfer(flowFile, REL_VALIDATION_FAILED);
-                    return; // CRITICAL: Don't call process.onTrigger()
-                } else {
-                    // WARNING mode: Log but continue
-                    getLogger().warn("Environment validation warning: {} - Proceeding anyway", 
-                        validationResult.getErrorMessage());
                 }
-            } else {
-                // Validation passed - add success attributes
-                flowFile = session.putAttribute(flowFile, "validation.passed", "true");
-                flowFile = session.putAttribute(flowFile, "validation.environment.id", 
-                    String.valueOf(validationResult.getEnvironmentId()));
-                flowFile = session.putAttribute(flowFile, "validation.environment.name", 
-                    validationResult.getEnvironmentName());
+            } catch (Exception e) {
+                // If validation itself fails, route to failure
+                getLogger().error("Failed to perform validation: {}", e.getMessage(), e);
+                flowFile = session.putAttribute(flowFile, "validation.passed", "false");
+                flowFile = session.putAttribute(flowFile, "validation.error", 
+                    "Validation failed with exception: " + e.getMessage());
                 flowFile = session.putAttribute(flowFile, "validation.timestamp", 
                     String.valueOf(System.currentTimeMillis()));
+                String validationMode = context.getProperty(VALIDATION_MODE).getValue();
+                if ("STRICT".equals(validationMode)) {
+                    session.transfer(flowFile, REL_VALIDATION_FAILED);
+                    return;
+                } else {
+                    getLogger().warn("Validation exception in WARNING mode - proceeding anyway: {}", e.getMessage());
+                }
             }
             
             // Step 5: Proceed with standard PutSQL execution
@@ -871,11 +891,16 @@ public class EnhancedPutSQL extends AbstractSessionFactoryProcessor {
 
         final int batchSize = context.getProperty(BATCH_SIZE).asInteger();
         final ControllerService service = context.getProperty(CONNECTION_POOL).asControllerService();
-        final DBCPService dbcpService = asDBCPService(service);
+        final Object dbcpService = asDBCPService(service);
         if (dbcpService == null) {
             throw new ProcessException("DBCP Service class not available. Ensure nifi-dbcp-service-api is available in NiFi runtime.");
         }
-        final FlowFileFilter dbcpServiceFlowFileFilter = dbcpService.getFlowFileFilter(batchSize);
+        FlowFileFilter dbcpServiceFlowFileFilter;
+        try {
+            dbcpServiceFlowFileFilter = getFlowFileFilterFromDBCPService(dbcpService, batchSize);
+        } catch (Exception e) {
+            throw new ProcessException("Failed to get FlowFileFilter from DBCP service: " + e.getMessage(), e);
+        }
         final List<FlowFile> selectedFlowFiles;
         if (useTransactions) {
             final TransactionalFlowFileFilter filter = new TransactionalFlowFileFilter(dbcpServiceFlowFileFilter);
@@ -1302,24 +1327,57 @@ public class EnhancedPutSQL extends AbstractSessionFactoryProcessor {
     // ========== Helper Methods ==========
 
     /**
-     * Safely cast ControllerService to DBCPService
-     * This method handles the case where DBCPService class might not be available at runtime
+     * Safely cast ControllerService to DBCPService using reflection
+     * Returns Object to avoid NoClassDefFoundError when DBCPService class is not available
      */
-    private DBCPService asDBCPService(ControllerService service) {
+    private Object asDBCPService(ControllerService service) {
         if (service == null) {
             return null;
         }
         try {
-            // Use instanceof to check if it's a DBCPService
-            // This will throw NoClassDefFoundError if DBCPService class is not available
-            if (service instanceof DBCPService) {
-                return (DBCPService) service;
+            // Use reflection to check if service implements DBCPService interface
+            // This avoids NoClassDefFoundError when DBCPService class is not available
+            Class<?> dbcpServiceClass = Class.forName("org.apache.nifi.dbcp.DBCPService");
+            if (dbcpServiceClass.isInstance(service)) {
+                return dbcpServiceClass.cast(service);
             }
             return null;
+        } catch (ClassNotFoundException e) {
+            // DBCPService interface not available - this is expected in some NiFi setups
+            getLogger().debug("DBCPService interface not available: {}", e.getMessage());
+            return null;
         } catch (NoClassDefFoundError e) {
-            getLogger().error("DBCPService class not available: {}", e.getMessage());
+            // DBCPService class not available at runtime
+            getLogger().debug("DBCPService class not available: {}", e.getMessage());
+            return null;
+        } catch (Exception e) {
+            getLogger().error("Unexpected error casting to DBCPService: {}", e.getMessage(), e);
             return null;
         }
+    }
+    
+    /**
+     * Get connection from DBCPService using reflection
+     */
+    private Connection getConnectionFromDBCPService(Object dbcpService, java.util.Map<String, String> attributes) throws Exception {
+        if (dbcpService == null) {
+            return null;
+        }
+        Class<?> dbcpServiceClass = dbcpService.getClass();
+        java.lang.reflect.Method getConnectionMethod = dbcpServiceClass.getMethod("getConnection", java.util.Map.class);
+        return (Connection) getConnectionMethod.invoke(dbcpService, attributes);
+    }
+    
+    /**
+     * Get FlowFileFilter from DBCPService using reflection
+     */
+    private FlowFileFilter getFlowFileFilterFromDBCPService(Object dbcpService, int batchSize) throws Exception {
+        if (dbcpService == null) {
+            return null;
+        }
+        Class<?> dbcpServiceClass = dbcpService.getClass();
+        java.lang.reflect.Method getFlowFileFilterMethod = dbcpServiceClass.getMethod("getFlowFileFilter", int.class);
+        return (FlowFileFilter) getFlowFileFilterMethod.invoke(dbcpService, batchSize);
     }
 
     // ========== Validation Helper Classes and Methods ==========
@@ -1387,7 +1445,7 @@ public class EnhancedPutSQL extends AbstractSessionFactoryProcessor {
      * Core validation method
      */
     private ValidationResultData performEnvironmentValidation(ProcessContext context, FlowFile flowFile,
-            DBCPService engineDbcp, DBCPService sourceDbcp, DBCPService targetDbcp,
+            Object engineDbcp, Object sourceDbcp, Object targetDbcp,
             String operationId) {
         try {
             // Query environment config from SSE Engine database
@@ -1433,14 +1491,18 @@ public class EnhancedPutSQL extends AbstractSessionFactoryProcessor {
     /**
      * Query environment configuration from SSE Engine database
      */
-    private EnvironmentConfig queryEnvironmentConfig(DBCPService engineDbcp, String operationId) 
+    private EnvironmentConfig queryEnvironmentConfig(Object engineDbcp, String operationId) 
             throws SQLException {
         Connection conn = null;
         PreparedStatement stmt = null;
         ResultSet rs = null;
         
         try {
-            conn = engineDbcp.getConnection();
+            try {
+                conn = getConnectionFromDBCPService(engineDbcp, emptyMap());
+            } catch (Exception e) {
+                throw new SQLException("Failed to get connection from DBCP service: " + e.getMessage(), e);
+            }
             
             // Query by operation ID
             String sql = "SELECT DISTINCT " +
@@ -1506,14 +1568,17 @@ public class EnhancedPutSQL extends AbstractSessionFactoryProcessor {
     /**
      * Extract JDBC URL from DBCP service
      */
-    private String extractJdbcUrlFromService(DBCPService dbcpService) {
+    private String extractJdbcUrlFromService(Object dbcpService) {
         Connection conn = null;
         try {
-            conn = dbcpService.getConnection();
+            conn = getConnectionFromDBCPService(dbcpService, emptyMap());
             DatabaseMetaData metadata = conn.getMetaData();
             return metadata.getURL();
         } catch (SQLException e) {
             getLogger().error("Failed to extract JDBC URL from service: {}", e.getMessage(), e);
+            return null;
+        } catch (Exception e) {
+            getLogger().error("Failed to get connection from DBCP service: {}", e.getMessage(), e);
             return null;
         } finally {
             if (conn != null) {

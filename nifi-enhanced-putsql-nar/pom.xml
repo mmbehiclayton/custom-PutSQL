@@ -32,10 +32,11 @@
 
         
         <!-- NiFi DBCP Service API - For database connection pool services -->
+        <!-- Changed to compile scope to bundle DBCPService interface -->
         <dependency>
             <groupId>org.apache.nifi</groupId>
             <artifactId>nifi-dbcp-service-api</artifactId>
-            <scope>provided</scope>
+            <scope>compile</scope>
         </dependency>
         
         <!-- NiFi DBCP Service Implementation - Provided by NiFi runtime -->
