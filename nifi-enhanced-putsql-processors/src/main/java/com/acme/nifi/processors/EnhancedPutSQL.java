@@ -1437,55 +1437,105 @@ public class EnhancedPutSQL extends AbstractSessionFactoryProcessor {
         String environmentName;
         String sourceDbType, sourceHost, sourceDatabase;
         Integer sourcePort;
+        Boolean sourceIsSid;  // Oracle SID flag
         String targetDbType, targetHost, targetDatabase;
         Integer targetPort;
+        Boolean targetIsSid;  // Oracle SID flag
     }
 
     /**
-     * Core validation method
+     * Main validation method that performs environment validation.
+     * This method orchestrates the entire validation process:
+     * 1. Extract operation_id from FlowFile attributes
+     * 2. Query SSE Engine database for environment configuration
+     * 3. Extract JDBC URLs from controller services
+     * 4. Compare actual URLs with expected URLs
+     * 5. Return validation result
      */
     private ValidationResultData performEnvironmentValidation(ProcessContext context, FlowFile flowFile,
             Object engineDbcp, Object sourceDbcp, Object targetDbcp,
             String operationId) {
-        try {
-            // Query environment config from SSE Engine database
-            EnvironmentConfig envConfig = queryEnvironmentConfig(engineDbcp, operationId);
-            
-            if (envConfig == null) {
-                return ValidationResultData.failure(operationId,
-                    "Environment configuration not found for operation-id: " + operationId);
-            }
-            
-            // Extract JDBC URLs from controller services
-            String sourceJdbcUrl = extractJdbcUrlFromService(sourceDbcp);
-            String targetJdbcUrl = extractJdbcUrlFromService(targetDbcp);
-            
-            // Build expected URLs from environment config
-            String expectedSourceUrl = buildJdbcUrl(envConfig.sourceDbType, envConfig.sourceHost, 
-                envConfig.sourcePort, envConfig.sourceDatabase);
-            String expectedTargetUrl = buildJdbcUrl(envConfig.targetDbType, envConfig.targetHost, 
-                envConfig.targetPort, envConfig.targetDatabase);
-            
-            // Compare URLs
-            boolean sourceMatches = compareJdbcUrls(sourceJdbcUrl, expectedSourceUrl);
-            boolean targetMatches = compareJdbcUrls(targetJdbcUrl, expectedTargetUrl);
-            
-            if (!sourceMatches || !targetMatches) {
-                String errorMsg = format(
-                    "Controller service mismatch for environment '%s' (ID: %d). " +
-                    "Source match: %s, Target match: %s.",
-                    envConfig.environmentName, envConfig.environmentId,
-                    sourceMatches, targetMatches);
-                return ValidationResultData.failure(operationId, errorMsg);
-            }
-            
-            return ValidationResultData.success(operationId, 
-                envConfig.environmentId, envConfig.environmentName);
-        } catch (Exception e) {
-            getLogger().error("Error during environment validation: {}", e.getMessage(), e);
-            return ValidationResultData.failure(operationId,
-                "Validation error: " + e.getMessage());
+        
+        // Step 1: Extract operation_id from FlowFile attributes
+        if (operationId == null || operationId.trim().isEmpty()) {
+            return ValidationResultData.failure(operationId, "operation_id is empty or not set");
         }
+        
+        getLogger().debug("Validating environment for operation_id: {}", operationId);
+        
+        // Step 2: Query environment configuration from SSE Engine database
+        EnvironmentConfig envConfig;
+        try {
+            envConfig = queryEnvironmentConfig(engineDbcp, operationId);
+        } catch (SQLException e) {
+            return ValidationResultData.failure(operationId, 
+                "Failed to query environment configuration: " + e.getMessage());
+        }
+        
+        if (envConfig == null) {
+            return ValidationResultData.failure(operationId, 
+                "No environment configuration found for operation_id: " + operationId);
+        }
+        
+        // Step 3: Extract JDBC URLs from controller services
+        String sourceJdbcUrl;
+        String targetJdbcUrl;
+        try {
+            sourceJdbcUrl = extractJdbcUrlFromService(sourceDbcp);
+            targetJdbcUrl = extractJdbcUrlFromService(targetDbcp);
+        } catch (SQLException e) {
+            return ValidationResultData.failure(operationId, 
+                "Failed to extract JDBC URLs from controller services: " + e.getMessage());
+        }
+        
+        // Step 4: Build expected JDBC URLs from environment configuration
+        String expectedSourceUrl = buildJdbcUrl(
+            envConfig.sourceDbType,
+            envConfig.sourceHost,
+            envConfig.sourcePort,
+            envConfig.sourceDatabase,
+            envConfig.sourceIsSid != null ? envConfig.sourceIsSid : false
+        );
+        
+        String expectedTargetUrl = buildJdbcUrl(
+            envConfig.targetDbType,
+            envConfig.targetHost,
+            envConfig.targetPort,
+            envConfig.targetDatabase,
+            envConfig.targetIsSid != null ? envConfig.targetIsSid : false
+        );
+        
+        // Log URLs for debugging (at debug level to avoid cluttering logs)
+        getLogger().debug("Expected Source URL: {}", expectedSourceUrl);
+        getLogger().debug("Actual Source URL: {}", sourceJdbcUrl);
+        getLogger().debug("Expected Target URL: {}", expectedTargetUrl);
+        getLogger().debug("Actual Target URL: {}", targetJdbcUrl);
+        
+        // Step 5: Compare URLs
+        boolean sourceMatches = compareJdbcUrls(sourceJdbcUrl, expectedSourceUrl);
+        boolean targetMatches = compareJdbcUrls(targetJdbcUrl, expectedTargetUrl);
+        
+        if (!sourceMatches || !targetMatches) {
+            // Validation failed - create detailed error message matching SseExecuteSQL
+            String errorMsg = format(
+                "Controller service mismatch for environment '%s' (ID: %d). " +
+                "Source match: %s, Target match: %s. " +
+                "Expected: Source=%s, Target=%s. " +
+                "Actual: Source=%s, Target=%s",
+                envConfig.environmentName,
+                envConfig.environmentId,
+                sourceMatches,
+                targetMatches,
+                expectedSourceUrl,
+                expectedTargetUrl,
+                sourceJdbcUrl,
+                targetJdbcUrl
+            );
+            return ValidationResultData.failure(operationId, errorMsg);
+        }
+        
+        // Validation passed
+        return ValidationResultData.success(operationId, envConfig.environmentId, envConfig.environmentName);
     }
 
     /**
@@ -1504,19 +1554,28 @@ public class EnhancedPutSQL extends AbstractSessionFactoryProcessor {
                 throw new SQLException("Failed to get connection from DBCP service: " + e.getMessage(), e);
             }
             
-            // Query by operation ID
+            // Query by operation ID - matches SseExecuteSQL query exactly
             String sql = "SELECT DISTINCT " +
                   "o.id as operation_id, " +
                   "o.environment_id, " +
                   "e.name as environment_name, " +
+                  "e.status as environment_status, " +
+                  "-- Source configuration details " +
+                  "sc.id as source_config_id, " +
                   "sc.database_type as source_db_type, " +
                   "sc.host as source_host, " +
                   "sc.port as source_port, " +
                   "sc.db_name as source_database, " +
+                  "sc.name as source_name, " +
+                  "sc.is_sid as source_is_sid, " +
+                  "-- Target configuration details " +
+                  "tc.id as target_config_id, " +
                   "tc.database_type as target_db_type, " +
                   "tc.host as target_host, " +
                   "tc.port as target_port, " +
-                  "tc.db_name as target_database " +
+                  "tc.db_name as target_database, " +
+                  "tc.name as target_name, " +
+                  "tc.is_sid as target_is_sid " +
                   "FROM operations o " +
                   "INNER JOIN environment_configurations e ON o.environment_id = e.id " +
                   "INNER JOIN database_configurations sc ON e.source_config_id = sc.id AND sc.deleted = FALSE " +
@@ -1534,16 +1593,31 @@ public class EnhancedPutSQL extends AbstractSessionFactoryProcessor {
             }
             
             EnvironmentConfig config = new EnvironmentConfig();
+            
+            // Environment details
             config.environmentId = rs.getLong("environment_id");
             config.environmentName = rs.getString("environment_name");
+            
+            // Source database configuration
             config.sourceDbType = rs.getString("source_db_type");
             config.sourceHost = rs.getString("source_host");
             config.sourcePort = rs.getInt("source_port");
             config.sourceDatabase = rs.getString("source_database");
+            // Handle is_sid - can be null, so check for null and default to false
+            int sourceIsSidInt = rs.getInt("source_is_sid");
+            config.sourceIsSid = rs.wasNull() ? false : (sourceIsSidInt != 0);
+            
+            // Target database configuration
             config.targetDbType = rs.getString("target_db_type");
             config.targetHost = rs.getString("target_host");
             config.targetPort = rs.getInt("target_port");
             config.targetDatabase = rs.getString("target_database");
+            // Handle is_sid - can be null, so check for null and default to false
+            int targetIsSidInt = rs.getInt("target_is_sid");
+            config.targetIsSid = rs.wasNull() ? false : (targetIsSidInt != 0);
+            
+            getLogger().info("Retrieved environment configuration: {} (ID: {})", 
+                config.environmentName, config.environmentId);
             
             return config;
         } finally {
@@ -1566,41 +1640,76 @@ public class EnhancedPutSQL extends AbstractSessionFactoryProcessor {
     }
 
     /**
-     * Extract JDBC URL from DBCP service
+     * Extracts JDBC URL from a DBCP service by getting connection metadata.
+     * 
+     * This method:
+     * 1. Gets a connection from the DBCP service
+     * 2. Gets the database metadata from the connection
+     * 3. Extracts the URL from the metadata
+     * 4. Closes the connection
+     * 
+     * @param dbcpService The DBCP service to extract URL from
+     * @return The JDBC URL string
+     * @throws SQLException if there's a database error
      */
-    private String extractJdbcUrlFromService(Object dbcpService) {
+    private String extractJdbcUrlFromService(Object dbcpService) throws SQLException {
         Connection conn = null;
         try {
+            // Get a connection from the DBCP service
             conn = getConnectionFromDBCPService(dbcpService, emptyMap());
+            
+            // Get database metadata from the connection
             DatabaseMetaData metadata = conn.getMetaData();
-            return metadata.getURL();
-        } catch (SQLException e) {
-            getLogger().error("Failed to extract JDBC URL from service: {}", e.getMessage(), e);
-            return null;
+            
+            // Extract the URL from the metadata
+            String url = metadata.getURL();
+            return url;
         } catch (Exception e) {
-            getLogger().error("Failed to get connection from DBCP service: {}", e.getMessage(), e);
-            return null;
+            if (e instanceof SQLException) {
+                throw (SQLException) e;
+            }
+            throw new SQLException("Failed to get connection from DBCP service: " + e.getMessage(), e);
         } finally {
+            // Always close the connection
             if (conn != null) {
-                try {
-                    conn.close();
-                } catch (SQLException ignored) {}
+                try { 
+                    conn.close(); 
+                } catch (SQLException e) { 
+                    getLogger().debug("Error closing connection", e); 
+                }
             }
         }
     }
 
     /**
-     * Build expected JDBC URL from database configuration
+     * Builds JDBC URL using the same logic as EnvironmentConnectionPoolController.
+     * 
+     * This method creates JDBC URLs in the standard format for different database types:
+     * - Oracle: jdbc:oracle:thin:@host:port/database (service name) or jdbc:oracle:thin:@host:port:database (SID)
+     * - PostgreSQL: jdbc:postgresql://host:port/database
+     * - MySQL: jdbc:mysql://host:port/database
+     * - SQL Server: jdbc:sqlserver://host:port;databaseName=database
+     * 
+     * @param dbType Database type (oracle, postgresql, mysql, sqlserver)
+     * @param host Hostname or IP address
+     * @param port Port number
+     * @param database Database name
+     * @param isSid Whether the database uses SID (Oracle only, true = use :, false = use /)
+     * @return Formatted JDBC URL
+     * @throws IllegalArgumentException if database type is not supported
      */
-    private String buildJdbcUrl(String dbType, String host, Integer port, String database) {
-        if (dbType == null || host == null || port == null || database == null) {
-            return null;
-        }
-        
+    private String buildJdbcUrl(String dbType, String host, int port, String database, boolean isSid) {
+        // Build URL based on database type (Java 11 compatible)
         String baseUrl;
         String dbTypeLower = dbType.toLowerCase();
+        
         if ("oracle".equals(dbTypeLower)) {
-            baseUrl = "jdbc:oracle:thin:@%s:%d/%s";
+            // Oracle: use ":" for SID, "/" for service name
+            if (isSid) {
+                baseUrl = "jdbc:oracle:thin:@%s:%d:%s";
+            } else {
+                baseUrl = "jdbc:oracle:thin:@%s:%d/%s";
+            }
         } else if ("postgresql".equals(dbTypeLower)) {
             baseUrl = "jdbc:postgresql://%s:%d/%s";
         } else if ("mysql".equals(dbTypeLower)) {
@@ -1610,6 +1719,8 @@ public class EnhancedPutSQL extends AbstractSessionFactoryProcessor {
         } else {
             throw new IllegalArgumentException("Unsupported database type: " + dbType);
         }
+        
+        // Format the URL with the provided parameters
         return format(baseUrl, host, port, database);
     }
 
@@ -1624,19 +1735,37 @@ public class EnhancedPutSQL extends AbstractSessionFactoryProcessor {
     }
 
     /**
-     * Normalize JDBC URL for comparison
+     * Normalizes JDBC URL for comparison by:
+     * 1. Removing query parameters (everything after ?)
+     * 2. Removing trailing slashes
+     * 3. Trimming whitespace
+     * 4. Converting to lowercase
+     * 
+     * This ensures that URLs like:
+     * - "jdbc:postgresql://host:5432/db?param=value" 
+     * - "jdbc:postgresql://host:5432/db/"
+     * - "jdbc:postgresql://HOST:5432/DB"
+     * 
+     * All become: "jdbc:postgresql://host:5432/db"
+     * 
+     * @param jdbcUrl The JDBC URL to normalize
+     * @return Normalized JDBC URL
      */
     private String normalizeJdbcUrl(String jdbcUrl) {
         if (jdbcUrl == null) {
             return "";
         }
-        // Remove query parameters
+        
+        // Remove query parameters (everything after ?)
         int queryIndex = jdbcUrl.indexOf('?');
         if (queryIndex > 0) {
             jdbcUrl = jdbcUrl.substring(0, queryIndex);
         }
-        // Remove trailing slashes
+        
+        // Remove trailing slashes using regex
         jdbcUrl = jdbcUrl.replaceAll("/+$", "");
+        
+        // Normalize whitespace and convert to lowercase
         return jdbcUrl.trim().toLowerCase();
     }
 }
